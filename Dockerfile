@@ -30,20 +30,22 @@ RUN apt-get update \
     && rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /src
-COPY runtime/Cargo.toml runtime/Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
+COPY runtime/Cargo.toml ./runtime/
 # Prime the dependency layer against the manifests alone, so editing src/ does
 # not re-download and rebuild the tree.
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+RUN mkdir -p runtime/src && echo 'fn main() {}' > runtime/src/main.rs \
+    && echo '' > runtime/src/lib.rs \
     && cargo build --release --locked --target x86_64-unknown-linux-musl \
-    && rm -rf src
+    && rm -rf runtime/src
 
-COPY runtime/src ./src
+COPY runtime/src ./runtime/src
 # The touch is load-bearing, not tidiness. Cargo decides freshness by mtime, COPY
 # preserves the context's timestamps, and if those land older than the stub
 # artifacts above then cargo declares the stub build fresh and the image ships a
 # binary whose main() does nothing -- a failure that builds green and only shows
 # up as a container that exits instantly.
-RUN touch src/main.rs src/lib.rs \
+RUN touch runtime/src/main.rs runtime/src/lib.rs \
     && cargo build --release --locked --target x86_64-unknown-linux-musl \
     && strip target/x86_64-unknown-linux-musl/release/openab-pty
 
