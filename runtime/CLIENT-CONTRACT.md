@@ -146,7 +146,8 @@ clear and redraw rather than rendering a sliced ANSI stream) and `ttl-warning`
 
 Binary frames are the shell's bytes, **verbatim**, with one narrow exception.
 The runtime answers *static* terminal-capability queries the child emits — Device
-Attributes (DA1/DA2), DSR status, kitty-keyboard flags, and OSC 10/11 colour — at
+Attributes (DA1/DA2 and tertiary DA), DSR status plus the DEC private `?` family,
+kitty-keyboard flags, and OSC colour queries (10/11/12 and palette index 4) — at
 the source, mirroring the reference client, and strips those queries from the
 PTY → client stream so they never reach you or the ring buffer. This lets a
 program negotiate even when no client is attached, and stops a `?since=` replay
@@ -154,7 +155,17 @@ from re-answering a query into a shell with no reader. Everything else is passed
 through untouched — a runtime that stripped general escape sequences would break
 the programs people attach to it.
 
-**Cursor Position Report (`CSI 6 n`) is the exception to the exception.** The
+Two behaviours of that proxy are worth knowing. The kitty query (`CSI ? u`) is
+answered with the flag state the client actually applied: the runtime watches
+`CSI >` / `CSI <` / `CSI = … u` (push/pop/set) go by on their way to you and keeps
+the same per-screen stack your emulator does, so an app that pushes flags and then
+queries is told its push succeeded. And OSC replies reuse the query's own
+terminator — a `BEL`-terminated query gets a `BEL`-terminated reply — rather than
+always `ESC \`; both are legal, and echoing the query's framing is what xterm
+does.
+
+**Cursor Position Report (`CSI 6 n`, and its DEC form `CSI ? 6 n`) is the
+exception to the exception.** The
 runtime has no screen model, so it cannot answer CPR; it passes the query through
 to you. If a program queries the cursor position, **your emulator must answer it**
 (SwiftTerm does so automatically). Because CPR is not consumed at the source it
