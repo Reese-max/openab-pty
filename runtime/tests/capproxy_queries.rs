@@ -394,6 +394,38 @@ fn a_query_split_across_process_calls_passes_both_halves() {
 }
 
 // ---------------------------------------------------------------------------
+// Filter mirror — every reply shape the proxy emits must also be stripped
+// client→PTY by TermFilter, or a client echo of a split/replayed query leaks
+// a duplicate answer into the child.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_answer_shape_the_proxy_emits_is_filtered_on_the_way_back() {
+    use openab_pty::termfilter::TermFilter;
+    let mut filter = TermFilter::new();
+    for reply in [
+        &b"\x1b[?65;1;2;6;21;22;17;28c"[..], // primary DA
+        b"\x1b[>65;20;1c",                   // secondary DA
+        b"\x1bP!|53776966745465726d\x1b\\",  // tertiary DA
+        b"\x1b[0n",                          // DSR ready
+        b"\x1b[?10n",                        // DSR ?-family …
+        b"\x1b[?27;1;0;0n",
+        b"\x1b[?997;1n",
+        b"\x1b[0*{",                         // macro space report
+        b"\x1bP7!~0000\x1b\\",               // macro checksum report
+        b"\x1b[?5u",                         // kitty flag report
+        b"\x1b]10;rgb:c7c7/c7c7/c7c7\x07",   // OSC fg colour
+        b"\x1b]12;rgb:c7c7/c7c7/c7c7\x1b\\", // OSC cursor colour
+        b"\x1b]4;1;rgb:cdcd/0000/0000\x07",  // OSC 4 palette
+    ] {
+        assert!(
+            filter.filter(reply).is_empty(),
+            "a proxied reply shape must be filtered: {reply:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interleaving with real output — answers concatenate in query order.
 // ---------------------------------------------------------------------------
 

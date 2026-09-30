@@ -176,7 +176,9 @@ impl CapabilityProxy {
         }
     }
 
-    /// Observability hook: how many queries this proxy answered.
+    /// Observability hook: how many queries this proxy handled — answered,
+    /// or deliberately consumed without a reply (e.g. an out-of-range OSC 4
+    /// index, where the client itself would stay silent).
     pub fn answered(&self) -> u64 {
         self.answered
     }
