@@ -36,6 +36,7 @@
 
 use crate::audit::{AuditEvent, AuditKind, AuditLogger, TerminationClass};
 use crate::capproxy::CapabilityProxy;
+use crate::cli_config;
 use crate::close_code;
 use crate::config::PtyConfig;
 use crate::killdomain::{KillDomain, KillDomainTier, SessionKillDomain, TeardownOutcome};
@@ -991,6 +992,13 @@ pub struct SessionManager {
     /// Set once the tools listener is bound. Every child spawned afterwards
     /// receives `OPENAB_TOOLS_MCP_URL`, its private loopback MCP endpoint.
     tools: Mutex<Option<ToolsEndpoint>>,
+    /// Serializes the shared read–modify–write of CLI config files across
+    /// concurrent spawns; without it two sessions could interleave a merge.
+    cli_config_lock: Mutex<()>,
+    /// The workspace a session lands in, when it is not the process HOME —
+    /// tests set this so config injection writes into their own tempdir
+    /// instead of the developer's `~/.kiro`.
+    workspace_override: Mutex<Option<PathBuf>>,
 }
 
 /// Where a session's coding CLI finds its reverse-attached Mac.
@@ -1038,6 +1046,8 @@ impl SessionManager {
             metrics: Metrics::default(),
             epoch: Instant::now(),
             tools: Mutex::new(None),
+            cli_config_lock: Mutex::new(()),
+            workspace_override: Mutex::new(None),
         }))
     }
 
@@ -1199,21 +1209,61 @@ impl SessionManager {
         );
         // The per-session loopback key is issued here, at spawn, so the URL in the
         // child's environment is the only place it ever exists in plaintext. A
-        // restart-in-place rotates it with the shell.
-        if let Some(endpoint) = self.tools.lock().as_ref() {
+        // restart-in-place rotates it with the shell. Endpoint reads end at the
+        // semicolon — file I/O for the CLI config happens with the guard dropped,
+        // so a slow filesystem cannot sit between the tools plane and a request.
+        let tools_env = self.tools.lock().as_ref().map(|endpoint| {
             let key = endpoint.hub.issue_loopback_key(&name);
+            [
+                (
+                    TOOLS_URL_ENV.to_string(),
+                    format!("{}/mcp/{}/{}", endpoint.base_url, name.as_str(), key),
+                ),
+                (TOOLS_TOKEN_ENV.to_string(), key),
+                (
+                    TOOLS_ENDPOINT_ENV.to_string(),
+                    format!("{}/mcp", endpoint.base_url),
+                ),
+            ]
+        });
+        if let Some(tools_env) = tools_env {
             env.retain(|(k, _)| {
                 k != TOOLS_URL_ENV && k != TOOLS_TOKEN_ENV && k != TOOLS_ENDPOINT_ENV
             });
-            env.push((
-                TOOLS_URL_ENV.to_string(),
-                format!("{}/mcp/{}/{}", endpoint.base_url, name.as_str(), key),
-            ));
-            env.push((TOOLS_TOKEN_ENV.to_string(), key));
-            env.push((
-                TOOLS_ENDPOINT_ENV.to_string(),
-                format!("{}/mcp", endpoint.base_url),
-            ));
+            env.extend(tools_env);
+            // Wire the tools MCP into the session CLI's config too (#39): the
+            // files are session-independent — the URL and key live only in
+            // this child's environment — so a shared workspace config needs
+            // no refresh on rotation and holds no secret. A failure here must
+            // never cost a spawn: the §9.3 env-var manual path still stands.
+            let _serialize = self.cli_config_lock.lock();
+            match cli_config::inject_tools_mcp(&self.workspace(), &env) {
+                Ok(cli_config::Outcome::Injected { variant, files }) => {
+                    tracing::info!(
+                        session = %name,
+                        variant,
+                        files = ?files,
+                        "tools MCP injected into the session CLI config"
+                    );
+                }
+                Ok(cli_config::Outcome::NoKnownVariant) => {}
+                Ok(cli_config::Outcome::NoJsRuntime { variant }) => {
+                    tracing::warn!(
+                        session = %name,
+                        variant,
+                        "tools MCP not injected: no JS runtime to run the \
+                         bridge; the env-var manual path remains"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session = %name,
+                        %error,
+                        "tools MCP CLI config injection failed; the env-var \
+                         manual path remains"
+                    );
+                }
+            }
         }
         let request = SpawnRequest {
             session: name.clone(),
@@ -1341,9 +1391,19 @@ impl SessionManager {
     }
 
     fn workspace(&self) -> PathBuf {
+        if let Some(path) = self.workspace_override.lock().clone() {
+            return path;
+        }
         std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"))
+    }
+
+    /// Point `workspace()` at `path` — tests only, so spawn-time config
+    /// injection never writes into a developer's real home directory.
+    #[cfg(test)]
+    pub(crate) fn set_test_workspace(&self, path: PathBuf) {
+        *self.workspace_override.lock() = Some(path);
     }
 
     /// Attach. The token must already have been verified by the attach surface;
@@ -2297,6 +2357,183 @@ mod tests {
         );
         assert!(env.contains(&("TERM".to_string(), DEFAULT_TERM.to_string())));
         assert!(env.contains(&("HOME".to_string(), "/workspace".to_string())));
+    }
+
+    // ---- tools MCP config injection (issue #39) --------------------------
+
+    /// A kiro-cli installer's layout under a fake home: `kiro-cli` and its
+    /// bundled `bun`, both executable — what `cli_config` detection keys on.
+    fn kiro_install(home: &std::path::Path) {
+        let dir = home.join(".local/share/kiro-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        for bin in ["kiro-cli", "bun"] {
+            let path = dir.join(bin);
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+    }
+
+    fn tools_endpoint() -> ToolsEndpoint {
+        ToolsEndpoint {
+            hub: Arc::new(crate::tools::ToolsHub::new(
+                Duration::from_secs(60),
+                AuditLogger,
+            )),
+            base_url: "http://127.0.0.1:4711".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tools_spawn_injects_session_independent_kiro_config() {
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
+        let home = tempfile::tempdir().unwrap();
+        kiro_install(home.path());
+        manager.set_test_workspace(home.path().to_path_buf());
+        manager.set_tools_endpoint(tools_endpoint());
+        manager
+            .create(name("alpha"), WindowSize::default())
+            .unwrap();
+
+        // The child env still carries the URL — that is what the injected
+        // config's bridge actually reads.
+        let env = spawner.last_env.lock().clone();
+        let url = env
+            .iter()
+            .find(|(k, _)| k == TOOLS_URL_ENV)
+            .map(|(_, v)| v.clone())
+            .expect("tools spawn must pass the MCP URL to the child");
+        assert!(url.starts_with("http://127.0.0.1:4711/mcp/alpha/"));
+
+        let mcp = std::fs::read_to_string(home.path().join(".kiro/settings/mcp.json")).unwrap();
+        assert!(mcp.contains("\"computer\""), "server alias: {mcp}");
+        assert!(
+            mcp.contains("${OPENAB_TOOLS_MCP_URL}"),
+            "env forward: {mcp}"
+        );
+        // The shared workspace file must never pin one session's URL or key:
+        // it is how a rotated key needed no rewrite.
+        assert!(!mcp.contains("4711"), "no endpoint literal: {mcp}");
+        assert!(
+            !mcp.contains(&url["http://127.0.0.1:4711".len()..]),
+            "no per-session URL or key: {mcp}"
+        );
+        assert!(home
+            .path()
+            .join(".local/share/openab-pty/computer-mcp-bridge.js")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn a_tools_spawn_on_a_cli_we_do_not_know_still_gets_the_env() {
+        // No kiro-cli anywhere → the env-var manual path, and zero files.
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
+        let home = tempfile::tempdir().unwrap();
+        manager.set_test_workspace(home.path().to_path_buf());
+        manager.set_tools_endpoint(tools_endpoint());
+        manager
+            .create(name("alpha"), WindowSize::default())
+            .unwrap();
+
+        let env = spawner.last_env.lock().clone();
+        assert!(env.iter().any(|(k, _)| k == TOOLS_URL_ENV));
+        assert!(!home.path().join(".kiro").exists());
+    }
+
+    #[tokio::test]
+    async fn a_spawn_without_the_tools_plane_writes_no_cli_config() {
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
+        let home = tempfile::tempdir().unwrap();
+        kiro_install(home.path());
+        manager.set_test_workspace(home.path().to_path_buf());
+        manager
+            .create(name("alpha"), WindowSize::default())
+            .unwrap();
+
+        let env = spawner.last_env.lock().clone();
+        assert!(env.iter().all(|(k, _)| {
+            k != TOOLS_URL_ENV && k != TOOLS_TOKEN_ENV && k != TOOLS_ENDPOINT_ENV
+        }));
+        assert!(!home.path().join(".kiro").exists());
+        assert!(!home.path().join(".local/share/openab-pty").exists());
+    }
+
+    #[tokio::test]
+    async fn a_restart_rotates_the_env_key_and_never_touches_the_config() {
+        // The literal acceptance criterion of #39: a re-lend or restart-in-
+        // place mints a new loopback key, and *nothing* has to be rewritten —
+        // the session-independent file stays byte-identical.
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
+        let home = tempfile::tempdir().unwrap();
+        kiro_install(home.path());
+        manager.set_test_workspace(home.path().to_path_buf());
+        manager.set_tools_endpoint(tools_endpoint());
+        manager
+            .create(name("alpha"), WindowSize::default())
+            .unwrap();
+        let mcp = home.path().join(".kiro/settings/mcp.json");
+        let config_before = std::fs::read(&mcp).unwrap();
+        let key_before = spawner
+            .last_env
+            .lock()
+            .iter()
+            .find(|(k, _)| k == TOOLS_TOKEN_ENV)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+
+        manager.restart_in_place(&name("alpha")).await.unwrap();
+
+        let env = spawner.last_env.lock().clone();
+        let key_after = env
+            .iter()
+            .find(|(k, _)| k == TOOLS_TOKEN_ENV)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_ne!(key_before, key_after, "a restart mints a fresh key");
+        let url = env
+            .iter()
+            .find(|(k, _)| k == TOOLS_URL_ENV)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(url.contains(&key_after), "the URL carries the new key");
+        assert_eq!(
+            std::fs::read(&mcp).unwrap(),
+            config_before,
+            "the shared config needs no refresh on key rotation"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_spawn_survives_an_unwritable_workspace() {
+        // Injection failing must never cost a spawn: the §9.3 env path still
+        // stands, and a session that couldn't write config is still a session.
+        let spawner = FakeSpawner::new();
+        let manager = manager_with(spawner.clone(), "", SessionPolicy::default());
+        let home = tempfile::tempdir().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        manager.set_test_workspace(home.path().to_path_buf());
+        manager.set_tools_endpoint(tools_endpoint());
+        manager
+            .create(name("alpha"), WindowSize::default())
+            .expect("a failed injection warns, it does not fail the spawn");
+
+        let env = spawner.last_env.lock().clone();
+        assert!(env.iter().any(|(k, _)| k == TOOLS_URL_ENV));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     // ---- admission ------------------------------------------------------

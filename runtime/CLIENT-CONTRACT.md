@@ -421,10 +421,55 @@ does not edit any CLI's config; whatever installs the CLI does that. Properties:
 
 #### Wiring the URL into the coding CLI
 
-The runtime sets the env vars; it does **not** edit the CLI's config. Whatever owns
-the session's workspace does that.
+The runtime sets the env vars **and** — for the CLI variants it knows — writes
+their config at spawn too, so the session's agent starts with the `computer`
+server present and its tools pre-trusted. A variant it does not know is left
+entirely alone and still works through the env vars and the manual steps below.
 
-**Preferred — one config for every session.** The file never changes, across
+**What the runtime writes (kiro-cli).** At every spawn, when `kiro-cli` is on the
+child's PATH (or under the installer's `~/.local` layout) and a JS runtime exists
+to run the bridge:
+
+- `~/.local/share/openab-pty/computer-mcp-bridge.js` — a small stdio MCP
+  bridge the runtime owns and rewrites each spawn. Every stdin line is one
+  JSON-RPC message, POSTed to `$OPENAB_TOOLS_MCP_URL`; it handles a JSON or SSE
+  reply and echoes `Mcp-Session-Id`.
+- `~/.kiro/settings/mcp.json` gains (or refreshes) exactly the `computer`
+  server — every other server and setting in the file is preserved:
+
+```json
+{
+  "mcpServers": {
+    "computer": {
+      "command": "<kiro's bundled bun, else bun/node on PATH>",
+      "args": ["<home>/.local/share/openab-pty/computer-mcp-bridge.js"],
+      "env": { "OPENAB_TOOLS_MCP_URL": "${OPENAB_TOOLS_MCP_URL}" }
+    }
+  }
+}
+```
+
+- every `~/.kiro/agents/*.json` gains `@computer/*` in `allowedTools` — the
+  served set under the platform-neutral alias — plus `@computer` in a
+  restrictive `tools` list, and an agent that opted out of mcp.json
+  (`includeMcpJson: false`) gets the `computer` entry merged into its own
+  `mcpServers`. Agent files are never *created*: a session with no agent file
+  keeps the manual trust path below, which is safer than writing one that
+  could shadow a built-in agent.
+
+**Why a bridge and not a URL.** The workspace `mcp.json` is shared by every
+session in the pod, so it cannot name one session's `/mcp/<session>/<key>`
+URL — the key rotates at each spawn, and a hard-coded URL silently dials the
+wrong session after a re-lend. The bridge form is session-independent: the
+config forwards `$OPENAB_TOOLS_MCP_URL` through `env`, and each CLI process
+reads its *own* value. Rotation therefore needs no rewrite — there is nothing
+in the file to refresh.
+
+If a spawn finds no `kiro-cli`, or no `bun`/`node` to run the bridge, nothing
+is written and the manual path below applies. A malformed or foreign-shaped
+config file is left byte-identical rather than replaced.
+
+**Manual path — one config for every session.** The file never changes, across
 sessions, restarts or re-lends, as long as the CLI expands environment variables in
 HTTP headers. `kiro-cli` does (`${VAR}` in `headers`; it does **not** expand `url`):
 
@@ -442,8 +487,8 @@ HTTP headers. `kiro-cli` does (`${VAR}` in `headers`; it does **not** expand `ur
 The port is fixed by `PTY_TOOLS_LISTEN`, so the URL is a constant. Each CLI process
 expands `${OPENAB_TOOLS_MCP_TOKEN}` from its own session's environment.
 
-**Per session — only when the config is private to one session.** For `kiro-cli`
-(2.13+), inside the session shell:
+**Manual path — per session, only when the config is private to one session.**
+For `kiro-cli` (2.13+), inside the session shell:
 
 ```sh
 kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
@@ -484,12 +529,12 @@ kiro-cli mcp add --name computer --url "$OPENAB_TOOLS_MCP_URL" --scope global
 Update `@mac/*` entries in an agent's `allowedTools` to `@computer/*` at the same
 time; keeping both aliases duplicates every served tool.
 
-**Caveat — the key rotates** (this is what the header form above avoids). The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
-*generation*: a restart-in-place, or tearing down and re-lending a Mac, mints a new
-URL, and any config that hard-codes the old one (both `mcp.json` and the agent's
-`allowedTools` server entry) must be updated. Re-run `mcp add`, or read
-`$OPENAB_TOOLS_MCP_URL` again, after each re-lend. Injecting and refreshing this
-automatically at session spawn is [tracked as #39](https://github.com/openabdev/openab-pty/issues/39); until then it is a documented manual step.
+**Caveat — the key rotates** (this is what both session-independent forms
+above avoid). The `<key>` in `$OPENAB_TOOLS_MCP_URL` is per session
+*generation*: a restart-in-place, or tearing down and re-lending a Mac, mints
+a new URL. A spawn writes the runtime-owned form again, so an injected
+`computer` entry is never stale; a *hand-configured* one that hard-codes a
+URL must be re-run or re-read after each re-lend.
 
 ### 9.4 Minimum viable lender
 
@@ -500,4 +545,6 @@ automatically at session spawn is [tracked as #39](https://github.com/openabdev/
    other 4xxx stop.
 5. Operator: `DELETE …/tools-attach` to withdraw; `POST` again before expiry to renew.
 
-The CLI side is zero steps: the URL is already in its environment.
+The CLI side is zero steps: on a known variant the `computer` server is
+already configured and trusted; on any other, the URL is already in its
+environment.

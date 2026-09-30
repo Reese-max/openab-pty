@@ -142,8 +142,10 @@ tailscale status | grep openab-pty     # find the address
 ## 6. Lending a Mac to a session (optional)
 
 With `PTY_TOOLS_LISTEN` set (the manifest sets `127.0.0.1:8091`), a Mac running
-`oab-instance-mcp` can **dial in** and lend its tools to one session; the coding
-CLI inside that session then finds them at the URL in `$OPENAB_TOOLS_MCP_URL`.
+`oab-instance-mcp` can **dial in** and lend its tools to one session. The coding
+CLI inside that session finds them at the URL in `$OPENAB_TOOLS_MCP_URL` — and
+on a known variant (today: `kiro-cli`) the spawn already wrote the `computer`
+server and its `allowedTools` trust, so no `mcp add` step exists at all.
 The pod initiates nothing and stores only a hash. Design:
 [reverse attach](https://github.com/openabdev/instance-mcp/blob/main/docs/adr/reverse-attach.md);
 wire contract: §9 of [`../runtime/CLIENT-CONTRACT.md`](../runtime/CLIENT-CONTRACT.md).
