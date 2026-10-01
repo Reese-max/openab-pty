@@ -8,8 +8,6 @@
 use crate::audit::{hash_fingerprint, AuditEvent, AuditKind, AuditLogger};
 use crate::containment::SecretBytes;
 use crate::{Error, Generation, SessionName};
-use rand::rngs::OsRng;
-use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -90,8 +88,7 @@ impl TokenStore {
             return Err(Error::Other("attach token TTL must be non-zero".into()));
         }
         let mut raw = [0u8; 32];
-        OsRng
-            .try_fill_bytes(&mut raw)
+        getrandom::fill(&mut raw)
             .map_err(|e| Error::Other(format!("OS RNG failed while minting attach token: {e}")))?;
 
         // Lowercase hex is RFC 6455 subprotocol-token-safe, unlike padded base64.
