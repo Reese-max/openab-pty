@@ -34,7 +34,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          workspaces: runtime
+          workspaces: .
 
       # Ordered so a formatting nit cannot mask a test failure. The previous
       # workflow put fmt first and failed fast, and the result was that clippy

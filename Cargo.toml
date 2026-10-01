@@ -1,0 +1,7 @@
+# The repo is one crate today — the runtime in `runtime/` — but the workspace
+# lives at the root so `cargo test --workspace`, `cargo fmt --all` and
+# `cargo clippy --workspace` work from the top of a checkout instead of only
+# inside the member directory.
+[workspace]
+members = ["runtime"]
+resolver = "2"
