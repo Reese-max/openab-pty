@@ -16,7 +16,14 @@
 //!    promise. An operator who required Tier 2 is refused here: it is not
 //!    implemented, and best effort must never be served under a guarantee's name.
 //! 4. Seeded state, applied into $HOME before anything can observe the workspace.
-//! 5. Bind, behind the fail-closed listener guard.
+//!    Then bind, behind the fail-closed listener guard (accepting nothing yet).
+//! 5. The image's startup hook, if any (`--startup-hook`): after seeding so it
+//!    layers on top of whatever the seed delivered, after binding so it is handed
+//!    the bound tools address. Best-effort, never fatal. The hook execs, so it is
+//!    an ordinary dumpable process for up to its timeout; that is safe only
+//!    because it is handed the session env allowlist, not this process's
+//!    environment, and because no session exists yet to read it.
+//! 6. Serve.
 //!
 //! Graceful shutdown runs the same order in reverse: notice → grace →
 //! `close_code::RUNTIME_REPLACED` → session teardown.
@@ -62,6 +69,13 @@ struct Cli {
     /// stored by the runtime; only the `sha256:` verifier belongs in a projection.
     #[arg(long)]
     generate_admin_credential: bool,
+
+    /// An executable the image provides, run once after seeding and before
+    /// serving — where an image wires its own CLI's config (e.g. the tools
+    /// MCP). Set by the image's entrypoint, not an operator knob. Best-effort:
+    /// a failure or timeout is logged and serving continues.
+    #[arg(long, value_name = "FILE")]
+    startup_hook: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -118,7 +132,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the Tokio runtime")?;
-    runtime.block_on(run(projection))
+    runtime.block_on(run(projection, cli.startup_hook))
 }
 
 fn print_generated_admin_credential() -> Result<()> {
@@ -174,7 +188,7 @@ fn validate_only(path: &PathBuf) -> Result<()> {
     }
 }
 
-async fn run(projection: PtyConfig) -> Result<()> {
+async fn run(projection: PtyConfig, startup_hook: Option<PathBuf>) -> Result<()> {
     let audit = AuditLogger;
 
     // (3) Kill domain. Reaping first (best effort, never fail-closed), then the
@@ -190,7 +204,7 @@ async fn run(projection: PtyConfig) -> Result<()> {
     let kill = Arc::new(KillDomain::new(TrackingLimits::default(), audit.clone()));
 
     let spawner = Arc::new(PortablePtySpawner);
-    // Seed before any session machinery exists, not merely before binding. /workspace is one trust zone shared by every
+    // (4) Seed before any session machinery exists, not merely before binding. /workspace is one trust zone shared by every
     // session, so a session must never be able to observe a half-applied archive --
     // and an agent whose steering files arrived late is an agent that behaved like a
     // different one for its first few seconds.
@@ -269,6 +283,35 @@ async fn run(projection: PtyConfig) -> Result<()> {
         )
     };
 
+    // (5) The image's startup hook. After the seed, so a seeded config file is
+    // what the hook edits rather than what overwrites the hook's edit; after the
+    // binds, so it is handed the tools address actually bound (the one sessions
+    // get) rather than re-deriving it; before serving, so no session exists and
+    // none can see a half-written config. It gets the session env allowlist,
+    // never this process's environment. See `openab_pty::hook`.
+    if let Some(hook) = startup_hook {
+        let tools_bound = tools_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.to_string());
+        // vars_os, not vars: a non-UTF-8 variable anywhere in the container's
+        // environment must not panic the runtime at boot. Such a variable is
+        // dropped (the allowlist names only ASCII keys anyway).
+        let source = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
+        let env = openab_pty::hook::hook_env(source, tools_bound.as_deref());
+        // Best-effort end to end: even the blocking task itself failing (a
+        // panic inside it) is a warning, never a reason to refuse to serve.
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            openab_pty::hook::run_startup_hook(&hook, &env, openab_pty::hook::STARTUP_HOOK_TIMEOUT)
+        })
+        .await
+        {
+            tracing::warn!(%error, "startup hook task failed; serving anyway");
+        }
+    }
+
+    // (6) Serve.
     let state = AppState::new(manager, verifier, admin, audit, server_config);
     server::serve_with_tools(state, listener, tools_listener, shutdown_signal())
         .await
