@@ -43,6 +43,108 @@ and a read-only root filesystem.
   apply [`deploy/k8s/networkpolicy-no-tailnet-egress.yaml`](../deploy/k8s/networkpolicy-no-tailnet-egress.yaml)
   and verify with the probe in §4.
 
+## Optional egress allowlist
+
+Open internet egress is the default because the agent CLI needs its model API,
+git remotes, and package registries. The default is not a data-exfiltration
+boundary: a compromised shell has both code execution and outbound access.
+Sensitive deployments can opt into one of the restrictive profiles below.
+
+> an egress allowlist narrows exfiltration, it doesn't stop it; pair it with
+> repo-scoped git credentials and read-only registry tokens.
+>
+> Allowing `github.com` allows pushing to *any* repo on github.com, including one
+> the attacker owns; the same is true for any git host, gist, or package registry
+> that accepts uploads. The model API is itself an outbound channel: whatever the
+> agent reads can be sent in a prompt. Use a fine-grained token or deploy key for
+> the repository, read-only registry tokens, and no general-purpose API keys in
+> the session.
+
+Kubernetes NetworkPolicy rules are additive. The existing
+[`networkpolicy-no-tailnet-egress.yaml`](../deploy/k8s/networkpolicy-no-tailnet-egress.yaml)
+is an **open-internet** profile that excludes only the tailnet ranges; do not
+leave it selecting the pod when enabling either restrictive profile, or its
+`0.0.0.0/0` rule will provide a direct bypass. In allowlist mode, the restrictive
+profile itself denies both tailnet and all unlisted internet egress, so it
+replaces the broad policy for that pod. This matters especially on a homelab
+node running `tailscaled`.
+
+### Cilium FQDN policy
+
+If the cluster runs Cilium with its DNS proxy enabled, apply
+[`deploy/k8s/egress-allowlist-cilium.yaml`](../deploy/k8s/egress-allowlist-cilium.yaml)
+after the pod is labelled `app: openab-pty`:
+
+```bash
+kubectl apply -f deploy/k8s/pod-tailscale.yaml
+kubectl apply -f deploy/k8s/egress-allowlist-cilium.yaml
+```
+
+The manifest is intentionally an example. Keep the model API host(s) for the
+selected image/provider and add its regional sign-in, update, or telemetry
+hosts as needed. `toFQDNs` matches DNS names and resulting IPs; it cannot limit
+HTTP paths, repository names, or which account a git host accepts. Cilium's DNS
+proxy must observe the lookup before the destination is reachable, and the
+CoreDNS selector may need adjustment for a distro whose DNS pods do not use
+`k8s-app=kube-dns`.
+
+The selector covers the whole pod network namespace, including the Tailscale
+sidecar. The example therefore includes the Tailscale control-plane names, but
+DERP addresses change and Tailscale may use their published IPs without a fresh
+DNS lookup. Verify tailnet connectivity after applying the policy and maintain
+the required DERP CIDR/proxy exception separately when needed; otherwise run
+the runtime and sidecar with a network arrangement that lets the sidecar keep
+its control path without reopening the shell's direct egress.
+
+### In-cluster filtering proxy
+
+For a CNI without DNS/FQDN rules, apply
+[`deploy/k8s/egress-via-proxy.yaml`](../deploy/k8s/egress-via-proxy.yaml). It
+allows the pod to reach only an in-cluster filtering proxy on TCP 3128 and
+cluster DNS. The proxy must enforce the host and port list itself; a proxy
+environment variable is advisory because a shell can unset it. The NetworkPolicy
+is the enforcement point that prevents a direct TCP/UDP bypass. Plain
+NetworkPolicy cannot filter DNS query names, so add resolver policy if DNS
+exfiltration is in scope; use the Cilium profile when DNS name filtering is
+required.
+
+Configure the session container's proxy URL through the runtime's explicit
+forwarding variables when you build the pod manifest, for example:
+
+```yaml
+- name: PTY_FORWARD_HTTPS_PROXY
+  value: http://egress-proxy.openab-pty.svc.cluster.local:3128
+- name: PTY_FORWARD_NO_PROXY
+  value: 127.0.0.1,localhost
+```
+
+The session child environment is an allowlist, so `HTTPS_PROXY` and `NO_PROXY`
+set only on the container are not inherited. `PTY_FORWARD_HTTPS_PROXY` becomes
+`HTTPS_PROXY` in the shell; `PTY_FORWARD_NO_PROXY` becomes `NO_PROXY`. Forward
+`PTY_FORWARD_HTTP_PROXY` too if a client or apt mirror needs plain HTTP. Keep
+external destinations out of `NO_PROXY`, and do not put proxy credentials in a
+checked-in manifest.
+
+### Starting host list
+
+Start with only the rows the selected CLI and workflow need; the Cilium example
+contains common examples so it is useful for the repository's published
+variants:
+
+| Purpose | Hosts / ports |
+|---|---|
+| Model APIs | `api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`, `api.x.ai`, or the endpoint documented by the selected provider; Kiro commonly uses `q.<region>.amazonaws.com` / `runtime.<region>.kiro.dev` over 443 |
+| Git remotes | `github.com`, `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`, `gitlab.com`, or `bitbucket.org`; HTTPS 443 and SSH 22 only when used |
+| npm | `registry.npmjs.org` over 443 |
+| PyPI | `pypi.org` and `files.pythonhosted.org` over 443 |
+| crates.io | `index.crates.io` and `static.crates.io` over 443 |
+| apt | The configured Debian/Ubuntu mirrors, such as `deb.debian.org`, `security.debian.org`, `archive.ubuntu.com`, and `security.ubuntu.com`; 80/443 |
+| Tailscale sidecar | `console.tailscale.com`, `controlplane.tailscale.com`, `log.tailscale.com`, `login.tailscale.com`, and the changing DERP set over 443; operational dependency of the pod, not an agent destination |
+
+Do not assume this list covers a vendor's login, update, telemetry, or provider
+proxy endpoints. Verify the selected agent's firewall documentation and remove
+hosts that the deployment does not use.
+
 ## 1. Generate the admin credential
 
 The runtime only ever holds a non-reversible `sha256:` verifier. The credential

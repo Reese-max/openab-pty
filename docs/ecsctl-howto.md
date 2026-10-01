@@ -207,6 +207,101 @@ its own task and share the workspace over EFS instead.
 
 ---
 
+## Optional egress allowlist
+
+The task definitions in this repository leave internet egress open because the
+agent CLI needs its model API, git remotes, and package registries. An ECS
+security group is an IP/port filter, not a hostname policy: it cannot express
+"allow `api.openai.com` but deny another host at the same address". A restrictive
+security group by itself therefore does not implement this feature.
+
+### Filtering proxy (recommended)
+
+Put an egress-filtering proxy in private subnets (an internal service, EC2
+proxy, or approved managed equivalent) and make the task's security group allow
+outbound TCP only to the proxy's security group and port, for example 3128.
+Use private subnets and `assignPublicIp: false` for the task. Permit DNS to the
+VPC resolver as required to resolve the proxy's private name; the proxy should
+resolve and enforce the external host list below. Do not leave a `0.0.0.0/0`
+security-group rule that gives the task a direct route around it.
+
+The proxy's allowlist should start with only the hosts the selected image and
+workflow use:
+
+- the configured model API (for example `api.anthropic.com`, `api.openai.com`,
+  `generativelanguage.googleapis.com`, `api.x.ai`, or Kiro's regional
+  `q.<region>.amazonaws.com` / `runtime.<region>.kiro.dev`);
+- git remotes and their required API/download hosts (`github.com`,
+  `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`,
+  `gitlab.com`, or `bitbucket.org`);
+- `registry.npmjs.org`;
+- `pypi.org` and `files.pythonhosted.org`;
+- `index.crates.io` and `static.crates.io`; and
+- the configured Debian/Ubuntu mirrors, such as `deb.debian.org`,
+  `security.debian.org`, `archive.ubuntu.com`, and `security.ubuntu.com`.
+
+Keep HTTPS on 443, SSH on 22 only for git remotes that actually use SSH, and
+HTTP on 80 only for mirrors that require it. Add vendor login/update/telemetry
+hosts deliberately; do not turn the proxy into a wildcard internet relay.
+
+In the `openab-pty` container in `deploy/ecs/pty-kiro.yaml`, forward the proxy
+environment explicitly:
+
+```yaml
+      env:
+        PTY_LISTEN: 127.0.0.1:8090
+        PTY_COMMAND: /usr/bin/bash
+        HOME: /workspace
+        PTY_FORWARD_HTTPS_PROXY: http://egress-proxy.internal:3128
+        PTY_FORWARD_NO_PROXY: 127.0.0.1,localhost
+```
+
+`PTY_FORWARD_HTTPS_PROXY` becomes `HTTPS_PROXY` in the session shell, and
+`PTY_FORWARD_NO_PROXY` becomes `NO_PROXY`. The runtime intentionally gives
+children an environment allowlist, so setting `HTTPS_PROXY` or `NO_PROXY` only
+on the container does not make it into a session. Forward
+`PTY_FORWARD_HTTP_PROXY` too when a client needs an HTTP proxy. These variables
+are advisory — a shell can unset them — so the security-group route and the
+proxy are the enforcement boundary. Keep external hosts out of `NO_PROXY`, and
+do not put proxy credentials in a checked-in task definition.
+
+The four-container `kiro-with-pty.yaml` shape also has an `openab` agent
+container. Its agent process does not pass through the PTY runtime's child
+allowlist, so set the vendor-supported `HTTPS_PROXY`/`NO_PROXY` directly on
+that container as well, while using the forwarded names above for terminal
+sessions.
+
+The `tailscale` sidecar shares the task ENI, so the same security-group and
+proxy path applies to its control-plane and DERP traffic. Permit the current
+Tailscale coordination endpoints and changing DERP set through the egress
+appliance, or use a separate network/task arrangement for the sidecar. Do not
+assume `PTY_FORWARD_*` configures Tailscale; it only forwards variables to PTY
+session children. Verify that the tailnet remains connected after tightening
+outbound rules.
+
+### PrivateLink or filtered NAT
+
+A PrivateLink endpoint can be used for a service that supports it. For general
+internet destinations, a NAT gateway alone is not a hostname allowlist: the
+usual design is a private task subnet routed through NAT plus AWS Network
+Firewall, a filtering proxy, or another egress appliance that enforces the
+same FQDN/port list. Keep the task's ECR, CloudWatch Logs, Secrets Manager, and
+other deployment-control-plane paths working through the required VPC
+endpoints or controlled egress; those image-pull and control-plane paths are
+separate from the session's model/git/registry allowlist.
+
+> an egress allowlist narrows exfiltration, it doesn't stop it; pair it with
+> repo-scoped git credentials and read-only registry tokens.
+>
+> Allowing `github.com` allows pushing to *any* repo on github.com, including one
+> the attacker owns; the same is true for any git host, gist, or package registry
+> that accepts uploads. The model API is itself an outbound channel: whatever the
+> agent reads can be sent in a prompt. Use a fine-grained token or deploy key for
+> the repository, read-only registry tokens, and no general-purpose API keys in
+> the session.
+
+---
+
 ## Deploy
 
 ```bash

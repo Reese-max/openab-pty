@@ -1,0 +1,163 @@
+# Opt-in restrictive egress profile for clusters running Cilium.
+#
+# This is an example, not a universal vendor endpoint list. Keep the model API
+# host(s) for the selected image/provider and remove the rest. Add any regional
+# auth, update, or telemetry endpoints that the selected CLI actually needs.
+# Cilium resolves the names through its DNS proxy and applies the resulting IP
+# identities; this is not a URL, path, or HTTP Host allowlist.
+#
+# The policy is standalone and default-deny for egress. NetworkPolicy and
+# CiliumNetworkPolicy rules are additive, so do not leave the broad
+# `networkpolicy-no-tailnet-egress.yaml` policy selecting this pod: its
+# 0.0.0.0/0 rule would otherwise reopen direct internet egress. In allowlist mode
+# this policy already blocks tailnet and every other unlisted destination.
+#
+# Requirements:
+#   - CiliumNetworkPolicy CRDs and the Cilium DNS proxy enabled.
+#   - CoreDNS labelled k8s-app=kube-dns (adjust the selector if your cluster
+#     uses a different label).
+#   - The pod label selected below, matching the existing pod manifest.
+#
+# The endpointSelector covers the whole pod network namespace, including the
+# tailscale sidecar. Its control-plane and DERP traffic therefore needs a path
+# too; the tailscale entries below are an operational dependency, not an agent
+# destination. DERP addresses are dynamic and may require a separately managed
+# proxy/CIDR exception if the sidecar cannot use this FQDN policy.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: openab-pty-egress-allowlist
+  namespace: openab-pty
+spec:
+  endpointSelector:
+    matchLabels:
+      app: openab-pty
+  enableDefaultDeny:
+    egress: true
+  egress:
+    # Cilium's FQDN policy learns names from DNS, so DNS is the only cluster
+    # egress permitted outside the explicit external destinations below.
+    - toEndpoints:
+        - matchLabels:
+            "k8s:k8s-app": kube-dns
+            "k8s:io.kubernetes.pod.namespace": kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              # Keep this list synchronized with the toFQDNs entries below. An
+              # unrestricted `*` would make cluster DNS an alternate egress
+              # channel for arbitrary names.
+              - matchPattern: api.anthropic.com
+              - matchPattern: api.openai.com
+              - matchPattern: generativelanguage.googleapis.com
+              - matchPattern: api.x.ai
+              - matchPattern: api.githubcopilot.com
+              - matchPattern: q.us-east-1.amazonaws.com
+              - matchPattern: q.eu-central-1.amazonaws.com
+              - matchPattern: runtime.us-east-1.kiro.dev
+              - matchPattern: runtime.eu-central-1.kiro.dev
+              - matchPattern: app.kiro.dev
+              - matchPattern: prod.us-east-1.auth.desktop.kiro.dev
+              - matchPattern: prod.download.cli.kiro.dev
+              - matchPattern: github.com
+              - matchPattern: api.github.com
+              - matchPattern: raw.githubusercontent.com
+              - matchPattern: codeload.github.com
+              - matchPattern: objects.githubusercontent.com
+              - matchPattern: release-assets.githubusercontent.com
+              - matchPattern: gitlab.com
+              - matchPattern: bitbucket.org
+              - matchPattern: registry.npmjs.org
+              - matchPattern: pypi.org
+              - matchPattern: files.pythonhosted.org
+              - matchPattern: index.crates.io
+              - matchPattern: static.crates.io
+              - matchPattern: deb.debian.org
+              - matchPattern: security.debian.org
+              - matchPattern: archive.ubuntu.com
+              - matchPattern: security.ubuntu.com
+              - matchPattern: console.tailscale.com
+              - matchPattern: controlplane.tailscale.com
+              - matchPattern: log.tailscale.com
+              - matchPattern: login.tailscale.com
+              - matchPattern: derp*-all.tailscale.com
+
+    # The deployment's userspace Tailscale sidecar shares this pod network
+    # namespace. These control-plane names keep it online; DERP is dynamic and
+    # may need a separately maintained CIDR/proxy exception as noted above.
+    - toFQDNs:
+        - matchName: console.tailscale.com
+        - matchName: controlplane.tailscale.com
+        - matchName: log.tailscale.com
+        - matchName: login.tailscale.com
+        - matchPattern: derp*-all.tailscale.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+    # Model APIs. Keep only the endpoint(s) used by the selected agent/provider.
+    # Claude, Codex, Gemini, and Grok are represented by their common endpoints.
+    - toFQDNs:
+        - matchName: api.anthropic.com
+        - matchName: api.openai.com
+        - matchName: generativelanguage.googleapis.com
+        - matchName: api.x.ai
+        - matchName: api.githubcopilot.com
+        # Kiro in the documented us-east-1 / Europe regions. Replace or extend
+        # these when the Kiro profile uses another region.
+        - matchName: q.us-east-1.amazonaws.com
+        - matchName: q.eu-central-1.amazonaws.com
+        - matchName: runtime.us-east-1.kiro.dev
+        - matchName: runtime.eu-central-1.kiro.dev
+        # Kiro sign-in and CLI update endpoints, when those flows are enabled.
+        - matchName: app.kiro.dev
+        - matchName: prod.us-east-1.auth.desktop.kiro.dev
+        - matchName: prod.download.cli.kiro.dev
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+
+    # Git remotes and the GitHub/GitLab endpoints commonly used by CLIs. Port 22
+    # is only for SSH remotes; HTTPS remotes use 443.
+    - toFQDNs:
+        - matchName: github.com
+        - matchName: api.github.com
+        - matchName: raw.githubusercontent.com
+        - matchName: codeload.github.com
+        - matchName: objects.githubusercontent.com
+        - matchName: release-assets.githubusercontent.com
+        - matchName: gitlab.com
+        - matchName: bitbucket.org
+      toPorts:
+        - ports:
+            - port: "22"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+
+    # Package registries and the Debian/Ubuntu mirrors used by apt. pypi.org
+    # redirects package downloads to files.pythonhosted.org, so both are listed.
+    # Keep mirrors that the image actually uses and remove the rest.
+    - toFQDNs:
+        - matchName: registry.npmjs.org
+        - matchName: pypi.org
+        - matchName: files.pythonhosted.org
+        - matchName: index.crates.io
+        - matchName: static.crates.io
+        - matchName: deb.debian.org
+        - matchName: security.debian.org
+        - matchName: archive.ubuntu.com
+        - matchName: security.ubuntu.com
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP

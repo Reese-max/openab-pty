@@ -19,6 +19,15 @@ Kubernetes Secret, which needs a service-account token — and
 exists to demonstrate. That setting is pod-level, so enabling it for the sidecar
 would hand a token to the terminal container too.
 
+For the opt-in restrictive egress profiles, use
+[`k8s/egress-allowlist-cilium.yaml`](k8s/egress-allowlist-cilium.yaml) with
+Cilium DNS/FQDN policy support, or
+[`k8s/egress-via-proxy.yaml`](k8s/egress-via-proxy.yaml) with an in-cluster
+filtering proxy. The operator notes in [`../docs/k8s-howto.md`](../docs/k8s-howto.md)
+explain the host list, proxy environment forwarding, and why the broad
+`networkpolicy-no-tailnet-egress.yaml` profile must not be left selected beside a
+restrictive policy.
+
 ## ECS Fargate — `ecs/taskdef.json`
 
 Verified on Fargate. Three platform-specific things this encodes, none of which

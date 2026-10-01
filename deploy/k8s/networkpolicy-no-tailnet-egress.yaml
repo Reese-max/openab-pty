@@ -18,6 +18,12 @@
 # cluster DNS, image-adjacent traffic, and the internet keep working. Inbound
 # (tailnet → sidecar → loopback) is unaffected: it does not traverse the pod's
 # egress rules.
+#
+# This is the open-internet profile, not an allowlist. Kubernetes NetworkPolicy
+# rules are additive: do not apply this policy alongside
+# `egress-allowlist-cilium.yaml` or `egress-via-proxy.yaml` and expect their
+# narrower rules to override this 0.0.0.0/0 rule. The restrictive profiles are
+# standalone and already block the tailnet because unlisted egress is denied.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

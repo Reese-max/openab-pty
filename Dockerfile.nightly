@@ -49,19 +49,21 @@ RUN apt-get update \
     && rustup target add "$(cat /rust-target)"
 
 WORKDIR /src
-COPY runtime/Cargo.toml runtime/Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+COPY Cargo.toml Cargo.lock ./
+COPY runtime/Cargo.toml ./runtime/
+RUN mkdir -p runtime/src && echo 'fn main() {}' > runtime/src/main.rs \
+    && echo '' > runtime/src/lib.rs \
     && cargo build --release --locked --target "$(cat /rust-target)" \
-    && rm -rf src
+    && rm -rf runtime/src
 
-COPY runtime/src ./src
+COPY runtime/src ./runtime/src
 # The touch is load-bearing: cargo decides freshness by mtime and COPY preserves
 # the context's timestamps, so without it the stub build above is declared fresh
 # and the image ships a binary whose main() does nothing.
 #
 # The built artifact is copied to an arch-independent path so the final-stage
 # COPY does not need to know the triple.
-RUN touch src/main.rs src/lib.rs \
+RUN touch runtime/src/main.rs runtime/src/lib.rs \
     && cargo build --release --locked --target "$(cat /rust-target)" \
     && strip "target/$(cat /rust-target)/release/openab-pty" \
     && cp "target/$(cat /rust-target)/release/openab-pty" /openab-pty

@@ -1,0 +1,54 @@
+# Opt-in restrictive egress profile for CNIs without DNS/FQDN policy support.
+#
+# Label the filtering proxy's backing pods app=egress-proxy, or change the
+# selector below. The proxy must enforce the same destination allowlist as the
+# Cilium example; this NetworkPolicy only limits the pod to the proxy and DNS.
+#
+# This policy is standalone and default-deny for egress. NetworkPolicy rules are
+# additive, so remove or stop selecting `networkpolicy-no-tailnet-egress.yaml`
+# before applying this profile. That existing policy deliberately allows
+# 0.0.0.0/0 except the tailnet and would otherwise allow a direct bypass.
+#
+# This selector also covers the Tailscale sidecar because Kubernetes policies are
+# pod-scoped. Give the sidecar its own transparent/proxy path for coordination and
+# DERP traffic; PTY_FORWARD_* only configures session children.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openab-pty-egress-via-proxy
+  namespace: openab-pty
+spec:
+  podSelector:
+    matchLabels:
+      app: openab-pty
+  policyTypes: ["Egress"]
+  egress:
+    # The in-cluster filtering proxy. Its service name is what the session's
+    # HTTPS_PROXY value should use; the policy selects the service's pods.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openab-pty
+          podSelector:
+            matchLabels:
+              app: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+
+    # DNS is needed to resolve the proxy service name. The session pod has no
+    # direct TCP/UDP path to external destinations, but plain NetworkPolicy
+    # cannot filter the names sent to kube-dns; add resolver policy if DNS
+    # exfiltration is in scope.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
